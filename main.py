@@ -6,6 +6,11 @@ from datetime import datetime
 import math
 import asyncio
 import sys
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging with proper encoding
 logging.basicConfig(
@@ -33,8 +38,8 @@ client = None
 async def init_client():
     global client
     client = await AsyncClient.create(
-        api_key=config["binance_api_key"],
-        api_secret=config["binance_secret_key"],
+        api_key=os.getenv('BINANCE_API_KEY'),
+        api_secret=os.getenv('BINANCE_API_SECRET'),
         testnet=True
     )
     return client
