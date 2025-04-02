@@ -7,6 +7,7 @@ import math
 import asyncio
 import sys
 import os
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -24,13 +25,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info("Logging system initialized")
 
-# Initialize FastAPI app
-app = FastAPI()
-
-# Load configuration
-with open("config.json", "r") as f:
-    config = json.load(f)
-
 # Initialize Binance client with testnet
 client = None
 
@@ -39,8 +33,8 @@ async def init_client():
     global client
     client = await AsyncClient.create(
         api_key=os.getenv('BINANCE_API_KEY'),
-        api_secret=os.getenv('BINANCE_API_SECRET'),
-        testnet=True
+        api_secret=os.getenv('BINANCE_SECRET_KEY'),
+        testnet=False  # SHOULD BE FALSE FOR LIVE TRADES AND TRUE FOR TESTNET TRADES
     )
     return client
 
@@ -48,18 +42,26 @@ async def init_client():
 positions = {}
 
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     global client
     client = await init_client()
     logger.info("Trading bot started successfully!")
 
+    yield
 
-@app.on_event("shutdown")
-async def shutdown_event():
+    # Shutdown
     if client:
         await client.close_connection()
         logger.info("Trading bot stopped successfully!")
+
+# Initialize FastAPI app with lifespan
+app = FastAPI(lifespan=lifespan)
+
+# Load configuration
+with open("config.json", "r") as f:
+    config = json.load(f)
 
 
 @app.post("/webhook")
@@ -70,12 +72,11 @@ async def handle_webhook(request: Request):
         logger.info("Received new trading signal:")
         logger.info(f"Side: {data.get('side', 'N/A')}")
         logger.info(f"Symbol: {data.get('symbol', 'N/A')}")
-        logger.info(f"Take Profit: {data.get('tp', 'N/A')} USDT")
-        logger.info(f"Stop Loss: {data.get('sl', 'N/A')} USDT")
         logger.info("=" * 50)
 
         # Validate signal data
-        required_fields = ["side", "symbol", "tp", "sl"]
+        # Removed tp and sl from required fields
+        required_fields = ["side", "symbol"]
         if not all(key in data for key in required_fields):
             error_msg = f"Invalid signal format. Required fields: {required_fields}"
             logger.error(error_msg)
@@ -112,38 +113,35 @@ async def execute_trade(client, signal_data):
     try:
         side = signal_data.get('side', '').lower()
         symbol = signal_data.get('symbol', '')
-        tp_price = float(signal_data.get('tp', 0))
-        sl_price = float(signal_data.get('sl', 0))
 
         logger.info(
-            f"Processing trade - Side: {side}, Symbol: {symbol}, TP: {tp_price}, SL: {sl_price}")
+            f"Processing trade - Side: {side}, Symbol: {symbol}")
+
+        # Get current market price first
+        ticker = await client.futures_symbol_ticker(symbol=symbol)
+        current_price = float(ticker['price'])
+        logger.info(f"Current market price: {current_price} USDT")
+
+        # Calculate TP and SL based on current price
+        risk_reward_ratio = 1  # Risk:Reward ratio (adjust as needed)
+        stop_loss_percentage = 0.001  # 1% stop loss (adjust as needed)
+
+        if side == 'long':
+            sl_price = current_price * (1 - stop_loss_percentage)
+            price_distance = current_price - sl_price
+            tp_price = current_price + (price_distance * risk_reward_ratio)
+        else:  # short
+            sl_price = current_price * (1 + stop_loss_percentage)
+            price_distance = sl_price - current_price
+            tp_price = current_price - (price_distance * risk_reward_ratio)
+
+        logger.info(f"Calculated TP price: {tp_price}, SL price: {sl_price}")
 
         # Get account balance
         account = await client.futures_account()
         balance = float([asset for asset in account['assets']
                         if asset['asset'] == 'USDT'][0]['walletBalance'])
         logger.info(f"Account balance: {balance} USDT")
-
-        # Get current market price
-        ticker = await client.futures_symbol_ticker(symbol=symbol)
-        current_price = float(ticker['price'])
-        logger.info(f"Current market price: {current_price} USDT")
-
-        # Validate price levels
-        if side == 'long':
-            if tp_price <= current_price:
-                raise ValueError(
-                    f"Take profit price ({tp_price}) must be higher than current price ({current_price})")
-            if sl_price >= current_price:
-                raise ValueError(
-                    f"Stop loss price ({sl_price}) must be lower than current price ({current_price})")
-        else:  # short
-            if tp_price >= current_price:
-                raise ValueError(
-                    f"Take profit price ({tp_price}) must be lower than current price ({current_price})")
-            if sl_price <= current_price:
-                raise ValueError(
-                    f"Stop loss price ({sl_price}) must be higher than current price ({current_price})")
 
         # Get symbol info for precision
         exchange_info = await client.futures_exchange_info()
@@ -171,14 +169,14 @@ async def execute_trade(client, signal_data):
         min_qty = float(lot_size_filter['minQty'])
         max_qty = float(lot_size_filter['maxQty'])
 
-        # Calculate quantity based on fixed position size of $100
-        position_size = 100  # Fixed position size in USDT
+        # Calculate quantity with margin buffer
+        position_size = balance * 0.90  # Use 95% of balance to leave margin buffer
         if balance < position_size:
-            position_size = balance  # Use whole portfolio if less than $100
+            position_size = balance * 0.90  # Use 95% of portfolio
             logger.info(
-                f"Using whole portfolio ({balance} USDT) as it's less than $100")
+                f"Using 95% of portfolio ({position_size} USDT) to maintain margin buffer")
 
-        # Calculate quantity with 50x leverage
+        # Calculate quantity with leverage
         leverage = 50
         raw_quantity = (position_size * leverage) / current_price
 
@@ -220,8 +218,14 @@ async def execute_trade(client, signal_data):
                 )
                 logger.info(
                     f"Closed existing position: {current_position_amt} {symbol}")
-                # Wait for position to close
-                await asyncio.sleep(2)
+                # Add delay to allow balance to settle
+                await asyncio.sleep(2)  # 2-second delay
+
+        # Get updated account balance after position close
+        account = await client.futures_account()
+        balance = float([asset for asset in account['assets']
+                        if asset['asset'] == 'USDT'][0]['walletBalance'])
+        logger.info(f"Updated balance after position close: {balance} USDT")
 
         # Verify position is closed
         positions = await client.futures_position_information(symbol=symbol)
@@ -257,62 +261,63 @@ async def execute_trade(client, signal_data):
             logger.error("Position was not opened successfully")
             return False
 
-        # Set take profit with activation price
+        # Place TP and SL orders
         try:
+            # Place Take Profit order
             tp_order = await client.futures_create_order(
                 symbol=symbol,
-                side=exit_side,
+                side='SELL' if side == 'long' else 'BUY',
                 type='TAKE_PROFIT_MARKET',
                 stopPrice=tp_price,
                 closePosition=True,
-                timeInForce='GTC',
+                timeInForce='GTE_GTC',
                 workingType='MARK_PRICE',
                 priceProtect=True
             )
-            logger.info(f"Take profit order set: {tp_order}")
-        except Exception as e:
-            logger.error(f"Error setting take profit order: {str(e)}")
-            # Try to close the position if TP fails
-            try:
-                await client.futures_create_order(
-                    symbol=symbol,
-                    side=exit_side,
-                    type='MARKET',
-                    quantity=quantity
-                )
-                logger.info("Closed position after TP error")
-            except Exception as close_error:
-                logger.error(f"Error closing position: {str(close_error)}")
-            raise
+            logger.info(f"Take Profit order placed: {tp_order}")
 
-        # Set stop loss with activation price
-        try:
+            # Place Stop Loss order
             sl_order = await client.futures_create_order(
                 symbol=symbol,
-                side=exit_side,
+                side='SELL' if side == 'long' else 'BUY',
                 type='STOP_MARKET',
                 stopPrice=sl_price,
                 closePosition=True,
-                timeInForce='GTC',
+                timeInForce='GTE_GTC',
                 workingType='MARK_PRICE',
                 priceProtect=True
             )
-            logger.info(f"Stop loss order set: {sl_order}")
+            logger.info(f"Stop Loss order placed: {sl_order}")
+
+            # Store order IDs and position info
+            positions[symbol] = {
+                'tp_order_id': tp_order['orderId'],
+                'sl_order_id': sl_order['orderId'],
+                'position_side': side,
+                'quantity': quantity
+            }
+            logger.info(f"Position and orders stored for {symbol}")
+
+            # Add position monitor
+            @client.futures_socket_manager.on_message
+            async def handle_position_update(msg):
+                if msg['e'] == 'ACCOUNT_UPDATE' and symbol in positions:
+                    # Check if position is closed
+                    position_data = next(
+                        (p for p in msg['a']['P'] if p['s'] == symbol), None)
+                    if position_data and float(position_data['pa']) == 0:
+                        # Position is closed, cancel any remaining orders
+                        try:
+                            await client.futures_cancel_all_open_orders(symbol=symbol)
+                            logger.info(
+                                f"Cleaned up remaining orders after position close for {symbol}")
+                            del positions[symbol]
+                        except Exception as e:
+                            logger.error(f"Error cleaning up orders: {str(e)}")
+
         except Exception as e:
-            logger.error(f"Error setting stop loss order: {str(e)}")
-            # Try to close the position and cancel TP if SL fails
-            try:
-                await client.futures_cancel_order(symbol=symbol, orderId=tp_order['orderId'])
-                await client.futures_create_order(
-                    symbol=symbol,
-                    side=exit_side,
-                    type='MARKET',
-                    quantity=quantity
-                )
-                logger.info("Closed position and cancelled TP after SL error")
-            except Exception as close_error:
-                logger.error(f"Error closing position: {str(close_error)}")
-            raise
+            logger.error(f"Error setting TP/SL orders: {str(e)}")
+            logger.info("Continuing with open position despite TP/SL error")
 
         return True
     except Exception as e:
